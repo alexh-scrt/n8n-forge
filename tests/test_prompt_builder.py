@@ -7,11 +7,13 @@ user message building, and error handling.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from n8n_forge.prompt_builder import (
+    _MAX_CATALOG_NODES,
     _get_example_workflow_json,
     _select_relevant_nodes,
     build_messages,
@@ -52,7 +54,6 @@ class TestSelectRelevantNodes:
             assert isinstance(node, NodeCatalogEntry)
 
     def test_result_capped_at_max_catalog_nodes(self) -> None:
-        from n8n_forge.prompt_builder import _MAX_CATALOG_NODES
         nodes = _select_relevant_nodes("all nodes in the entire catalog")
         assert len(nodes) <= _MAX_CATALOG_NODES
 
@@ -64,13 +65,43 @@ class TestSelectRelevantNodes:
     def test_includes_core_utility_nodes(self) -> None:
         nodes = _select_relevant_nodes("complex data transformation")
         type_names = [n.type_name for n in nodes]
-        # At minimum some core nodes should be present
         core_types = {
             "n8n-nodes-base.code",
             "n8n-nodes-base.set",
             "n8n-nodes-base.if",
         }
         assert any(t in type_names for t in core_types)
+
+    def test_email_description_includes_email_nodes(self) -> None:
+        nodes = _select_relevant_nodes("send emails to customers")
+        type_names = [n.type_name for n in nodes]
+        email_types = {
+            "n8n-nodes-base.sendEmail",
+            "n8n-nodes-base.gmail",
+            "n8n-nodes-base.emailReadImap",
+        }
+        assert any(t in type_names for t in email_types)
+
+    def test_postgres_description_includes_database_nodes(self) -> None:
+        nodes = _select_relevant_nodes("query postgres database")
+        type_names = [n.type_name for n in nodes]
+        assert "n8n-nodes-base.postgres" in type_names
+
+    def test_returns_non_empty_list(self) -> None:
+        nodes = _select_relevant_nodes("do anything")
+        assert len(nodes) > 0
+
+    def test_triggers_appear_first(self) -> None:
+        """Trigger nodes should always be at the beginning of the list."""
+        nodes = _select_relevant_nodes("send a slack alert on a schedule")
+        # The first node should be a trigger
+        assert nodes[0].is_trigger is True
+
+    def test_empty_description_still_returns_triggers(self) -> None:
+        # Even with an empty-ish query, triggers should be present
+        nodes = _select_relevant_nodes("")
+        type_names = [n.type_name for n in nodes]
+        assert "n8n-nodes-base.scheduleTrigger" in type_names
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +115,6 @@ class TestGetExampleWorkflowJson:
     def test_returns_valid_json_string(self) -> None:
         example = _get_example_workflow_json()
         assert isinstance(example, str)
-        # Must be parseable JSON
         parsed = json.loads(example)
         assert isinstance(parsed, dict)
 
@@ -124,6 +154,47 @@ class TestGetExampleWorkflowJson:
         ids = [n["id"] for n in example["nodes"]]
         assert len(ids) == len(set(ids))
 
+    def test_example_node_names_are_unique(self) -> None:
+        example = json.loads(_get_example_workflow_json())
+        names = [n["name"] for n in example["nodes"]]
+        assert len(names) == len(set(names))
+
+    def test_example_nodes_have_required_fields(self) -> None:
+        example = json.loads(_get_example_workflow_json())
+        required_fields = {"id", "name", "type", "typeVersion", "position", "parameters"}
+        for node in example["nodes"]:
+            for field in required_fields:
+                assert field in node, f"Node missing field '{field}': {node}"
+
+    def test_example_active_is_false(self) -> None:
+        """Generated workflows should default to inactive."""
+        example = json.loads(_get_example_workflow_json())
+        assert example["active"] is False
+
+    def test_example_has_settings(self) -> None:
+        example = json.loads(_get_example_workflow_json())
+        assert "settings" in example
+        assert example["settings"]["executionOrder"] == "v1"
+
+    def test_example_connection_source_matches_node_name(self) -> None:
+        example = json.loads(_get_example_workflow_json())
+        node_names = {n["name"] for n in example["nodes"]}
+        for source in example["connections"]:
+            assert source in node_names, (
+                f"Connection source '{source}' not found in node names"
+            )
+
+    def test_example_connection_target_matches_node_name(self) -> None:
+        example = json.loads(_get_example_workflow_json())
+        node_names = {n["name"] for n in example["nodes"]}
+        for source, output_map in example["connections"].items():
+            for groups in output_map.values():
+                for group in groups:
+                    for conn in group:
+                        assert conn["node"] in node_names, (
+                            f"Connection target '{conn['node']}' not found in node names"
+                        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for render_system_prompt
@@ -156,7 +227,6 @@ class TestRenderSystemPrompt:
             node_catalog_text="catalog",
             example_workflow_json=None,
         )
-        # The example section should not appear
         assert "EXAMPLE OUTPUT" not in result
 
     def test_output_contains_n8n_structure_guidance(self) -> None:
@@ -166,7 +236,6 @@ class TestRenderSystemPrompt:
 
     def test_output_contains_json_instruction(self) -> None:
         result = render_system_prompt(node_catalog_text="catalog")
-        # Must instruct LLM to output JSON only
         assert "json" in result.lower()
 
     def test_output_contains_trigger_guidance(self) -> None:
@@ -180,13 +249,40 @@ class TestRenderSystemPrompt:
     def test_bad_templates_dir_raises_runtime_error(self) -> None:
         import n8n_forge.prompt_builder as pb
         original_dir = pb._TEMPLATES_DIR
-        from pathlib import Path
         pb._TEMPLATES_DIR = Path("/nonexistent/path/to/templates")
         try:
             with pytest.raises(RuntimeError, match="Templates directory not found"):
                 pb._get_jinja_env()
         finally:
             pb._TEMPLATES_DIR = original_dir
+
+    def test_output_is_non_empty_with_empty_catalog(self) -> None:
+        result = render_system_prompt(node_catalog_text="")
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_example_json_section_present_when_provided(self) -> None:
+        example = json.dumps({"name": "Ex", "nodes": [], "connections": {}, "active": False})
+        result = render_system_prompt(
+            node_catalog_text="catalog",
+            example_workflow_json=example,
+        )
+        assert "EXAMPLE OUTPUT" in result
+
+    def test_output_mentions_position_guidance(self) -> None:
+        """System prompt should include guidance about node positions."""
+        result = render_system_prompt(node_catalog_text="catalog")
+        assert "position" in result.lower()
+
+    def test_output_mentions_unique_ids(self) -> None:
+        """System prompt should instruct about unique node IDs."""
+        result = render_system_prompt(node_catalog_text="catalog")
+        assert "id" in result.lower() or "uuid" in result.lower()
+
+    def test_output_mentions_scheduling_rules(self) -> None:
+        """System prompt should include scheduling rule examples."""
+        result = render_system_prompt(node_catalog_text="catalog")
+        assert "scheduleTrigger" in result or "schedule" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +298,12 @@ class TestBuildUserMessage:
         msg = build_user_message(description=desc)
         assert desc in msg
 
-    def test_fresh_generation_no_existing_workflow(self) -> None:
+    def test_fresh_generation_mentions_generate(self) -> None:
         msg = build_user_message(description="Do something")
-        # Should not mention existing workflow
-        assert "existing" not in msg.lower() or "refine" not in msg.lower()
+        assert any(
+            word in msg.lower()
+            for word in ["generate", "create", "automation", "workflow"]
+        )
 
     def test_refinement_contains_description(self) -> None:
         existing = '{"name": "Old Workflow", "nodes": []}'
@@ -232,8 +330,40 @@ class TestBuildUserMessage:
     def test_description_is_stripped(self) -> None:
         msg = build_user_message(description="  Send a report  ")
         assert "Send a report" in msg
-        # Should not have extra spaces around the description
         assert "  Send a report  " not in msg
+
+    def test_refinement_existing_json_wrapped_in_code_block(self) -> None:
+        existing = '{"name": "Wf", "nodes": []}'
+        msg = build_user_message(
+            description="Add a step",
+            existing_workflow_json=existing,
+        )
+        # The existing JSON should appear inside a code block
+        assert "```" in msg or existing in msg
+
+    def test_fresh_generation_does_not_mention_existing_workflow(self) -> None:
+        msg = build_user_message(description="Do something cool")
+        assert "existing" not in msg.lower() or "refine" not in msg.lower()
+
+    def test_whitespace_in_existing_json_stripped(self) -> None:
+        existing = '  {"name": "Wf"}  '
+        msg = build_user_message(
+            description="Fix it",
+            existing_workflow_json=existing,
+        )
+        # The stripped version should appear
+        assert '{"name": "Wf"}' in msg
+
+    def test_returns_string(self) -> None:
+        msg = build_user_message(description="Something")
+        assert isinstance(msg, str)
+
+    def test_refinement_returns_string(self) -> None:
+        msg = build_user_message(
+            description="Something",
+            existing_workflow_json='{"name": "x"}',
+        )
+        assert isinstance(msg, str)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +405,6 @@ class TestBuildMessages:
     def test_system_message_contains_catalog_text(self) -> None:
         messages = build_messages(description="Send Slack alerts")
         system_content = messages[0]["content"]
-        # System prompt should have node catalog information
         assert "n8n-nodes-base" in system_content
 
     def test_system_message_contains_schedule_trigger(self) -> None:
@@ -292,21 +421,22 @@ class TestBuildMessages:
             build_messages(description="   ")
 
     def test_refinement_mode_includes_existing_json_in_user_message(self) -> None:
-        existing = json.dumps({"name": "Old Workflow", "nodes": [], "connections": {}, "active": False})
+        existing = json.dumps(
+            {"name": "Old Workflow", "nodes": [], "connections": {}, "active": False}
+        )
         messages = build_messages(
             description="Add an email step",
             existing_workflow_json=existing,
         )
         assert "Old Workflow" in messages[1]["content"]
 
-    def test_refinement_mode_system_prompt_unchanged(self) -> None:
-        """System prompt should be same structure for both fresh and refine modes."""
+    def test_refinement_mode_system_prompt_unchanged_structure(self) -> None:
+        """System prompt should have same structure for both fresh and refine modes."""
         fresh_messages = build_messages(description="Do something")
         refine_messages = build_messages(
             description="Do something",
             existing_workflow_json='{"name": "x", "nodes": [], "connections": {}, "active": false}',
         )
-        # System prompts should both contain catalog info
         assert "n8n-nodes-base" in fresh_messages[0]["content"]
         assert "n8n-nodes-base" in refine_messages[0]["content"]
 
@@ -317,7 +447,6 @@ class TestBuildMessages:
             model_context_hint="salesforce crm",
         )
         system_content = messages_with_hint[0]["content"]
-        # Salesforce-related content should appear
         assert "salesforce" in system_content.lower() or "Salesforce" in system_content
 
     def test_messages_have_only_role_and_content_keys(self) -> None:
@@ -344,3 +473,63 @@ class TestBuildMessages:
         system_content = messages[0]["content"]
         assert "connections" in system_content
         assert "main" in system_content
+
+    def test_system_prompt_contains_example_workflow(self) -> None:
+        """System prompt should inject an example workflow for few-shot grounding."""
+        messages = build_messages(description="Do anything")
+        system_content = messages[0]["content"]
+        # The example workflow should have been injected
+        assert "Schedule Trigger" in system_content or "scheduleTrigger" in system_content
+
+    def test_system_prompt_contains_output_format_instructions(self) -> None:
+        """System prompt must instruct the model on exact output format."""
+        messages = build_messages(description="Some workflow")
+        system_content = messages[0]["content"]
+        # Should mention JSON code block format
+        assert "```json" in system_content or "code block" in system_content.lower()
+
+    def test_multiple_calls_produce_consistent_structure(self) -> None:
+        """build_messages should be deterministic for the same input."""
+        desc = "Send a daily report"
+        msgs1 = build_messages(description=desc)
+        msgs2 = build_messages(description=desc)
+        assert msgs1[0]["role"] == msgs2[0]["role"]
+        assert msgs1[1]["role"] == msgs2[1]["role"]
+        assert msgs1[0]["content"] == msgs2[0]["content"]
+        assert msgs1[1]["content"] == msgs2[1]["content"]
+
+    def test_long_description_does_not_raise(self) -> None:
+        """build_messages should handle very long descriptions gracefully."""
+        long_desc = "Send a Slack notification " * 100
+        messages = build_messages(description=long_desc)
+        assert len(messages) == 2
+        assert long_desc.strip() in messages[1]["content"]
+
+    def test_special_characters_in_description(self) -> None:
+        """Descriptions with special chars should not break prompt building."""
+        desc = 'Send an email with subject "Report: Q1 & Q2" for <all> users'
+        messages = build_messages(description=desc)
+        assert desc in messages[1]["content"]
+
+    def test_context_hint_without_match_does_not_raise(self) -> None:
+        """A context hint that matches no nodes should not raise."""
+        messages = build_messages(
+            description="Do something",
+            model_context_hint="xyzzy_nonexistent_service",
+        )
+        assert len(messages) == 2
+
+    def test_refinement_user_message_includes_return_instruction(self) -> None:
+        """Refinement mode user message should ask for a complete updated workflow."""
+        existing = json.dumps(
+            {"name": "Old", "nodes": [], "connections": {}, "active": False}
+        )
+        messages = build_messages(
+            description="Add a filter",
+            existing_workflow_json=existing,
+        )
+        user_content = messages[1]["content"].lower()
+        assert any(
+            word in user_content
+            for word in ["complete", "updated", "return", "full"]
+        )

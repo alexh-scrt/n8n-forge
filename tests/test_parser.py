@@ -565,7 +565,9 @@ class TestNormaliseWorkflowDict:
 
     def test_unknown_connection_source_dropped(self) -> None:
         data = _make_minimal_workflow_dict()
-        data["connections"]["Nonexistent"] = {"main": [[{"node": "HTTP Request", "type": "main", "index": 0}]]}
+        data["connections"]["Nonexistent"] = {
+            "main": [[{"node": "HTTP Request", "type": "main", "index": 0}]]
+        }
         result = normalise_workflow_dict(data)
         assert "Nonexistent" not in result["connections"]
 
@@ -629,13 +631,12 @@ class TestParseWorkflowResponse:
         with pytest.raises(JSONDecodeError):
             parse_workflow_response("```json\n{invalid json here}\n```")
 
-    def test_raises_validation_error_on_duplicate_node_ids(self) -> None:
+    def test_raises_validation_error_on_duplicate_node_ids_in_strict_mode(self) -> None:
         data = _make_minimal_workflow_dict()
-        # Force duplicate IDs to trigger schema validation failure
+        # Force duplicate IDs to trigger schema validation failure in strict mode
         data["nodes"][0]["id"] = "same-id"
         data["nodes"][1]["id"] = "same-id"
         raw = _wrap_in_fenced_block(json.dumps(data))
-        # Normalisation should resolve this, but if strict=True it should fail
         with pytest.raises(WorkflowValidationError):
             parse_workflow_response(raw, strict=True)
 
@@ -753,6 +754,28 @@ class TestParseWorkflowResponse:
         assert workflow.get_connection_count() == 3
         assert workflow.get_trigger_nodes()[0].name == "Schedule Trigger"
 
+    def test_response_with_js_comments_cleaned(self) -> None:
+        """LLM output with JS comments should be cleaned before parsing."""
+        data = _make_minimal_workflow_dict()
+        json_str = json.dumps(data, indent=2)
+        # Inject a JS comment
+        json_with_comment = json_str.replace(
+            '"active": false',
+            '"active": false // workflow is inactive by default'
+        )
+        raw = _wrap_in_fenced_block(json_with_comment)
+        workflow = parse_workflow_response(raw)
+        assert workflow.name == "Test Workflow"
+        assert workflow.active is False
+
+    def test_response_with_bom_stripped(self) -> None:
+        """BOM character at the start of JSON should be stripped cleanly."""
+        json_str = _make_minimal_workflow_json()
+        # Prepend BOM inside the fenced block
+        raw = f"```json\n\ufeff{json_str}\n```"
+        workflow = parse_workflow_response(raw)
+        assert workflow.name == "Test Workflow"
+
 
 # ---------------------------------------------------------------------------
 # Tests for workflow_to_json_string
@@ -818,6 +841,30 @@ class TestWorkflowToJsonString:
         assert len(workflow2.nodes) == len(workflow.nodes)
         assert workflow2.get_connection_count() == workflow.get_connection_count()
 
+    def test_connection_items_serialised_as_dicts(self) -> None:
+        """Connections in the output JSON should be plain dicts, not model objects."""
+        workflow = self._make_workflow()
+        result = workflow_to_json_string(workflow)
+        parsed = json.loads(result)
+        conn = parsed["connections"]["Schedule Trigger"]["main"][0][0]
+        assert isinstance(conn, dict)
+        assert conn["node"] == "HTTP Request"
+        assert conn["type"] == "main"
+        assert conn["index"] == 0
+
+    def test_node_fields_present_in_output(self) -> None:
+        """Each serialised node should include all required fields."""
+        workflow = self._make_workflow()
+        result = workflow_to_json_string(workflow)
+        parsed = json.loads(result)
+        for node in parsed["nodes"]:
+            assert "id" in node
+            assert "name" in node
+            assert "type" in node
+            assert "typeVersion" in node
+            assert "position" in node
+            assert "parameters" in node
+
 
 # ---------------------------------------------------------------------------
 # Tests for exception classes
@@ -850,3 +897,23 @@ class TestParserExceptions:
     def test_parser_error_raw_response_default_empty(self) -> None:
         exc = ParserError("msg")
         assert exc.raw_response == ""
+
+    def test_json_extraction_error_stores_raw_response(self) -> None:
+        exc = JSONExtractionError("Not found", raw_response="some raw text")
+        assert exc.raw_response == "some raw text"
+
+    def test_json_decode_error_stores_raw_response(self) -> None:
+        exc = JSONDecodeError("Cannot decode", raw_response="{bad}")
+        assert exc.raw_response == "{bad}"
+
+    def test_parser_error_message_attribute(self) -> None:
+        exc = ParserError("Something bad happened")
+        assert exc.message == "Something bad happened"
+
+    def test_json_extraction_error_message_attribute(self) -> None:
+        exc = JSONExtractionError("No JSON found at all")
+        assert exc.message == "No JSON found at all"
+
+    def test_json_decode_error_message_attribute(self) -> None:
+        exc = JSONDecodeError("JSON syntax error on line 3")
+        assert exc.message == "JSON syntax error on line 3"
